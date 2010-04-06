@@ -90,7 +90,7 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface,
       return ENGINE_ENOTSUP;
    }
 
-   struct luaeng *engine = malloc(sizeof(*engine));
+   struct luaeng *engine = calloc(1, sizeof(*engine));
    if (engine == NULL) {
       return ENGINE_ENOMEM;
    }
@@ -122,9 +122,6 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface,
       .server = *api,
       .initialized = true,
       .lock = PTHREAD_MUTEX_INITIALIZER,
-      .free_stack = NULL,
-      .free_stack_top = -1,
-      .free_stack_size = 0,
       .stats = {
          .lock = PTHREAD_MUTEX_INITIALIZER
       },
@@ -136,6 +133,10 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface,
 
    luaeng.server = *api;
    *engine = luaeng;
+
+   if (pthread_key_create(&engine->tld, NULL) != 0) {
+      return ENGINE_ENOMEM;
+   }
 
    *handle = (ENGINE_HANDLE*)&engine->engine;
    return ENGINE_SUCCESS;
@@ -172,14 +173,19 @@ static lua_State* create_lua(struct luaeng* luaeng) {
 static lua_State* acquire_lua(struct luaeng* luaeng) {
    lua_State* L = NULL;
 
-   pthread_mutex_lock(&luaeng->lock);
-   if (luaeng->free_stack != NULL &&
-       luaeng->free_stack_top >= 0) {
-      L = luaeng->free_stack[luaeng->free_stack_top];
-      luaeng->free_stack[luaeng->free_stack_top] = NULL;
-      luaeng->free_stack_top--;
+   struct luaeng_tld* tld = pthread_getspecific(luaeng->tld);
+   if (tld == NULL) {
+      tld = calloc(1, sizeof(*tld));
+      pthread_setspecific(luaeng->tld, tld);
    }
-   pthread_mutex_unlock(&luaeng->lock);
+
+   if (tld != NULL &&
+       tld->free_stack != NULL &&
+       tld->free_stack_top >= 0) {
+      L = tld->free_stack[tld->free_stack_top];
+      tld->free_stack[tld->free_stack_top] = NULL;
+      tld->free_stack_top--;
+   }
 
    if (L == NULL) {
       L = create_lua(luaeng);
@@ -189,20 +195,19 @@ static lua_State* acquire_lua(struct luaeng* luaeng) {
 }
 
 static void release_lua(struct luaeng* luaeng, lua_State* L) {
-   pthread_mutex_lock(&luaeng->lock);
-
-   luaeng->free_stack_top++;
-   assert(luaeng->free_stack_top >= 0);
-   if (luaeng->free_stack_top >= luaeng->free_stack_size) {
-      luaeng->free_stack_size = luaeng->free_stack_size * 2;
-      if (luaeng->free_stack_size < INIT_FREE_STACK_SIZE) {
-         luaeng->free_stack_size = INIT_FREE_STACK_SIZE;
+   struct luaeng_tld* tld = pthread_getspecific(luaeng->tld);
+   if (tld != NULL) {
+      tld->free_stack_top++;
+      assert(tld->free_stack_top >= 0);
+      if (tld->free_stack_top >= tld->free_stack_size) {
+         tld->free_stack_size = tld->free_stack_size * 2;
+         if (tld->free_stack_size < INIT_FREE_STACK_SIZE) {
+            tld->free_stack_size = INIT_FREE_STACK_SIZE;
+         }
+         tld->free_stack = realloc(tld->free_stack, tld->free_stack_size * sizeof(lua_State*));
       }
-      luaeng->free_stack = realloc(luaeng->free_stack, luaeng->free_stack_size * sizeof(lua_State*));
+      tld->free_stack[tld->free_stack_top] = L;
    }
-   luaeng->free_stack[luaeng->free_stack_top] = L;
-
-   pthread_mutex_unlock(&luaeng->lock);
 }
 
 /**
@@ -368,7 +373,7 @@ static void luaeng_item_release(ENGINE_HANDLE* UNUSED(handle),
 }
 
 static ENGINE_ERROR_CODE luaeng_item_get(ENGINE_HANDLE* handle,
-                                         const void* UNUSED(cookie),
+                                         const void* cookie,
                                          item** it,
                                          const void* key,
                                          const int nkey) {
@@ -377,16 +382,31 @@ static ENGINE_ERROR_CODE luaeng_item_get(ENGINE_HANDLE* handle,
 
    ENGINE_ERROR_CODE res = ENGINE_KEY_ENOENT;
 
-   char keybuf[KEY_BUFFER_MAX];
-   assert((size_t) nkey < sizeof(keybuf));
-   memcpy(keybuf, key, nkey);
-   keybuf[nkey] = '\0';
-
-   int i = 0;
-
-   call_lua_va(L, "memcached_get", "s>i", keybuf, &i);
-
    *it = NULL;
+
+   lua_getglobal(L, "memcached_get");
+   lua_pushlstring(L, key, nkey);
+
+   int nres = 3;
+
+   if (lua_pcall(L, 1, nres, 0) != 0) {
+      fprintf(stderr, "memcached_get lua error: %s\n", lua_tostring(L, -1));
+      exit(EXIT_FAILURE);
+   }
+
+   nres = -nres;
+
+   size_t val_len = 0;
+   const char* val = lua_tolstring(L, nres++, &val_len);
+   if (val != NULL) {
+      int it_flg = (int) lua_tonumber(L, nres++);
+      int it_exp = (int) lua_tonumber(L, nres++);
+
+      if (luaeng_item_allocate(handle, cookie, it, key, nkey, val_len, it_flg, it_exp) == ENGINE_SUCCESS) {
+         memcpy(item_get_data(*it), val, val_len);
+         res = ENGINE_SUCCESS;
+      }
+   }
 
    release_lua(se, L);
    return res;
@@ -402,14 +422,18 @@ static ENGINE_ERROR_CODE luaeng_item_store(ENGINE_HANDLE* handle,
 
    ENGINE_ERROR_CODE res = ENGINE_NOT_STORED;
 
-   char keybuf[KEY_BUFFER_MAX];
-   assert(it->nkey < sizeof(keybuf));
-   memcpy(keybuf, item_get_key(it), it->nkey);
-   keybuf[it->nkey] = '\0';
+   lua_getglobal(L, "memcached_store");
 
-   int i = 0;
+   lua_pushlstring(L, item_get_key(it), it->nkey);
+   lua_pushnumber(L, operation);
+   lua_pushlstring(L, item_get_data(it), it->nbytes);
+   lua_pushnumber(L, it->flags);
+   lua_pushnumber(L, it->exptime);
 
-   call_lua_va(L, "memcached_store", "si>i", keybuf, operation, &i);
+   if (lua_pcall(L, 5, 1, 0) != 0) {
+      fprintf(stderr, "memcached_store lua error: %s\n", lua_tostring(L, -1));
+      exit(EXIT_FAILURE);
+   }
 
    release_lua(se, L);
    return res;
@@ -423,16 +447,15 @@ static ENGINE_ERROR_CODE luaeng_item_remove(ENGINE_HANDLE* handle,
    struct luaeng* se = get_handle(handle);
    lua_State *L = acquire_lua(se);
 
-   ENGINE_ERROR_CODE res = ENGINE_KEY_ENOENT;
+   ENGINE_ERROR_CODE res = ENGINE_SUCCESS;
 
-   char keybuf[KEY_BUFFER_MAX];
-   assert(nkey < sizeof(keybuf));
-   memcpy(keybuf, key, nkey);
-   keybuf[nkey] = '\0';
+   lua_getglobal(L, "memcached_remove");
+   lua_pushlstring(L, key, nkey);
 
-   int i = 0;
-
-   call_lua_va(L, "memcached_remove", "s>i", keybuf, &i);
+   if (lua_pcall(L, 1, 1, 0) != 0) {
+      fprintf(stderr, "memcached_remove lua error: %s\n", lua_tostring(L, -1));
+      exit(EXIT_FAILURE);
+   }
 
    release_lua(se, L);
    return res;
@@ -469,7 +492,6 @@ static ENGINE_ERROR_CODE luaeng_flush(ENGINE_HANDLE* handle,
    int i = 0;
 
    call_lua_va(L, "memcached_flush", "i>i", when, &i);
-
 
    release_lua(se, L);
    return res;

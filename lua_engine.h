@@ -59,6 +59,15 @@ struct luaeng_stats {
 };
 
 /**
+ * Thread local data.
+ */
+struct luaeng_tld {
+   lua_State **free_stack;      // Array of unused lua interpreters.
+   int         free_stack_top;  // 0-based index to first free entry in the free_lua_arr, -1 when empty.
+   int         free_stack_size; // Total number of entries in the free_stack.
+};
+
+/**
  * Definition of the private instance data used by the lua engine.
  *
  * This is currently "work in progress" so it is not as clean as it should be.
@@ -72,11 +81,9 @@ struct luaeng {
     */
    bool initialized;
 
-   pthread_mutex_t lock;
+   pthread_key_t tld;
 
-   lua_State **free_stack;      // Array of unused lua interpreters.
-   int         free_stack_top;  // 0-based index to first free entry in the free_lua_arr, -1 when empty.
-   int         free_stack_size; // Total number of entries in the free_stack.
+   pthread_mutex_t lock;
 
    struct luaeng_config config;
    struct luaeng_stats stats;
