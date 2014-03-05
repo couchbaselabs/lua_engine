@@ -1,5 +1,6 @@
 # lua_engine
 # Copyright (C) 2010 Trond Norbye, Steve Yen
+# Copyright (C) 2014 Couchbase, Inc.
 # All rights reserved.
 #
 # Use and distribution licensed under the BSD license.  See
