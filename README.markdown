@@ -1,25 +1,9 @@
-# Memcached Lua Engine
+# Couchbase Lua Engine
 
 ## Building
 
-You will need a storage-engine capable memcached and its included
-headers.
-
-The easiest way to do this if you don't want to install memcached from
-source would be to just create a source tree and reference it.
-
-### Building Memcached
-
-For example, assume you keep all of your projects in `~/prog/`, you
-can do this:
-
-    cd ~/prog
-    git clone git://github.com/dustin/memcached.git
-    cd memcached
-    git checkout --track -b engine origin/engine
-    ./config/autorun.sh
-    ./configure
-    make
+You will need a development environment for Couchbase, in particular the
+headers from memcached.
 
 ### Building the Lua Engine
 
@@ -32,7 +16,9 @@ can do this:
 
 ## Running
 
-An example invocation:
+TODO: document how to plug this in with Couchbase.
+
+Against memcached directly, here is an example invocation:
 
     ~/prog/memcached/memcached -v \
        -E ~/prog/lua_engine/.libs/lua_engine.so
